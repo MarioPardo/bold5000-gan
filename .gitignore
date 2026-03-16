@@ -1,1 +1,4 @@
-*.venv/*
+*.venv/
+*processed_data/**/*.pt
+label_mappings/instances_train2014.json
+label_mappings/imagenet_class_index.json

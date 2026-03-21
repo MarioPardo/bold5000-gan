@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore")
 
 BOLD5000_DIR = "/media/hdd/BOLD5000"
 OUTPUT_DIR   = "/home/mariop/Documents/Programming/bold5000-gan/processed_data"
-N_ROIS       = 400   #num Schaefer regions 
+N_ROIS       = 414   # 400 Schaefer regions + 14 subcortical regions
 
 SESSIONS = {
     "CSI1": list(range(1, 16)),
@@ -196,10 +196,13 @@ def load_session_betas(subject: str, session: int, correct_affine: np.ndarray) -
     return nib.Nifti1Image(data, correct_affine)
 
 
-def build_masker(n_rois: int = 400) -> tuple[NiftiLabelsMasker, np.ndarray]:
+def build_masker(n_rois: int = 400) -> tuple[NiftiLabelsMasker, np.ndarray, NiftiLabelsMasker, np.ndarray]:
+    import nibabel as nib
+    import numpy as np
+    
     """
     Fetch the Schaefer atlas and build a fitted-ready masker.
-
+    Also fetch the Harvard-Oxford subcortical atlas and build its masker.
     """
     atlas = datasets.fetch_atlas_schaefer_2018(
         n_rois=n_rois, yeo_networks=7, resolution_mm=2
@@ -216,10 +219,47 @@ def build_masker(n_rois: int = 400) -> tuple[NiftiLabelsMasker, np.ndarray]:
         lbl.decode() if isinstance(lbl, bytes) else str(lbl)
         for lbl in atlas.labels
     ]
-    parcel_names = np.array([l for l in raw_labels if l.lower() != "background"])
-    assert len(parcel_names) == n_rois, \
-        f"Expected {n_rois} parcel names after stripping background, got {len(parcel_names)}"
-    return masker, parcel_names
+    parcel_names_ctx = np.array([l for l in raw_labels if l.lower() != "background"])
+    assert len(parcel_names_ctx) == 400, \
+        f"Expected 400 parcel names after stripping background, got {len(parcel_names_ctx)}"
+
+    subcortical_atlas = datasets.fetch_atlas_harvard_oxford('sub-maxprob-thr25-2mm')
+    
+    # 14 ENIGMA regions
+    # Thalamus, Caudate, Putamen, Pallidum, Hippocampus, Amygdala, Accumbens
+    target_labels = [
+        'Left Thalamus', 'Right Thalamus',
+        'Left Caudate', 'Right Caudate',
+        'Left Putamen', 'Right Putamen',
+        'Left Pallidum', 'Right Pallidum',
+        'Left Hippocampus', 'Right Hippocampus',
+        'Left Amygdala', 'Right Amygdala',
+        'Left Accumbens', 'Right Accumbens'
+    ]
+    
+    # create mapping
+    label_list = subcortical_atlas.labels
+    label_to_id = {label: i for i, label in enumerate(label_list)}
+    target_ids = [label_to_id[label] for label in target_labels]
+    
+    maps = subcortical_atlas.maps
+    data = maps.get_fdata()
+    
+    new_data = np.zeros_like(data)
+    for i, target_id in enumerate(target_ids):
+        new_data[data == target_id] = i + 1
+        
+    filtered_maps = nib.Nifti1Image(new_data, maps.affine, maps.header)
+    
+    sub_masker = NiftiLabelsMasker(
+        labels_img=filtered_maps,
+        standardize=False,
+        resampling_target="data",
+        verbose=0
+    )
+    parcel_names_sub = np.array(target_labels)
+    
+    return masker, parcel_names_ctx, sub_masker, parcel_names_sub
 
 
 # ── Main processing function  ───────────────────────────────────────────────────
@@ -228,7 +268,9 @@ def build_masker(n_rois: int = 400) -> tuple[NiftiLabelsMasker, np.ndarray]:
 def process_subject(
     subject: str,
     masker: NiftiLabelsMasker,
-    parcel_names: np.ndarray,
+    parcel_names_ctx: np.ndarray,
+    sub_masker: NiftiLabelsMasker,
+    parcel_names_sub: np.ndarray,
     imagenet_synset_to_label: dict,
     coco_img_to_categories: dict,
     sessions: list[int] | None = None,
@@ -240,7 +282,7 @@ def process_subject(
     if sessions is None:
         sessions = SESSIONS[subject]
 
-    n_rois = len(parcel_names)
+    n_rois = len(parcel_names_ctx) + len(parcel_names_sub)
 
     print(f"\n{'='*60}")
     print(f"  Processing subject: {subject}  ({len(sessions)} sessions, {n_rois} ROIs)")
@@ -265,8 +307,12 @@ def process_subject(
         beta_img = load_session_betas(subject, sesh, correct_affine)
         n_trials = beta_img.shape[3]
 
-        # Extract Schaefer regional averages: (n_trials, n_rois)
-        session_betas = masker.fit_transform(beta_img)
+        # Extract Schaefer regional averages: (n_trials, 400)
+        cortical_betas = masker.fit_transform(beta_img)
+        # Extract subcortical: (n_trials, 14)
+        subcortical_betas = sub_masker.fit_transform(beta_img)
+        
+        session_betas = np.hstack((cortical_betas, subcortical_betas))
 
         # Image names for this session
         session_imgnames = imgnames_all[trial_cursor: trial_cursor + n_trials]
@@ -323,7 +369,7 @@ def process_subject(
         local_idxs      = local_idxs_array,      
         dataset_sources = dataset_sources_array,   
         labels          = labels_array,           
-        parcel_names    = parcel_names,          
+        parcel_names    = np.concatenate((parcel_names_ctx, parcel_names_sub)),          
     )
 
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
@@ -343,9 +389,13 @@ def process_subject(
 
 def main():
 
+    load_label_resources("/media/hdd/BOLD5000")
+
+    '''
+
     bold5000_dir = "/media/hdd/BOLD5000"
     output_dir   = "/home/mariop/Documents/Programming/bold5000-gan/processed_data"
-    n_rois       = N_ROIS       # 400 Schaefer regions
+    n_rois       = 400       # 400 Schaefer regions
     subjects     = ["CSI1", "CSI2", "CSI3", "CSI4"]
     sessions     = None         # None = all sessions for each subject
 
@@ -353,15 +403,15 @@ def main():
     print(f"Output dir      : {output_dir}")
     print(f"Subjects        : {subjects}")
     print(f"Sessions        : {sessions if sessions else 'all'}")
-    print(f"Atlas ROIs      : {n_rois}")
+    print(f"Atlas ROIs      : {n_rois} + 14")
 
     print("\nLoading label resources (ImageNet + COCO) ...")
     imagenet_synset_to_label, coco_img_to_categories = load_label_resources(bold5000_dir)
     print("✓ Label resources ready")
 
-    print("\nFetching Schaefer atlas ...")
-    masker, parcel_names = build_masker(n_rois=n_rois)
-    print(f"✓ Atlas ready — {len(parcel_names)} parcels")
+    print("\nFetching Schaefer & Subcortical atlas ...")
+    masker, parcel_names_ctx, sub_masker, parcel_names_sub = build_masker(n_rois=n_rois)
+    print(f"✓ Atlas ready — {len(parcel_names_ctx)} cortical + {len(parcel_names_sub)} subcortical parcels")
 
     saved_files = []
     for subject in subjects:
@@ -374,7 +424,9 @@ def main():
         out_path = process_subject(
             subject                  = subject,
             masker                   = masker,
-            parcel_names             = parcel_names,
+            parcel_names_ctx         = parcel_names_ctx,
+            sub_masker               = sub_masker,
+            parcel_names_sub         = parcel_names_sub,
             imagenet_synset_to_label = imagenet_synset_to_label,
             coco_img_to_categories   = coco_img_to_categories,
             sessions                 = sessions,
@@ -387,6 +439,8 @@ def main():
     for f in saved_files:
         print(f"    {f}")
     print(f"{'='*60}\n")
+
+    '''
 
 
 if __name__ == "__main__":
